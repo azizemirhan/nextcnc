@@ -1,13 +1,11 @@
 """
-3D toolpath renderer using PyOpenGL (Compatibility Profile for macOS).
-Draws polyline from (N, 3) points; simple orbit camera via mouse.
+3D toolpath and stock renderer using PyOpenGL.
+Draws polyline toolpath and tri-dexel stock mesh.
 """
 
 import math
 import numpy as np
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QSurfaceFormat
-from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from nextcnc.qt_compat import Qt, QSurfaceFormat, QOpenGLWidget
 
 from OpenGL.GL import (
     GL_COLOR_BUFFER_BIT,
@@ -17,6 +15,10 @@ from OpenGL.GL import (
     GL_FLOAT,
     GL_VERTEX_SHADER,
     GL_FRAGMENT_SHADER,
+    GL_TRIANGLES,
+    GL_CULL_FACE,
+    GL_FRONT,
+    GL_BACK,
 )
 from OpenGL.GL import (
     glClear,
@@ -32,6 +34,8 @@ from OpenGL.GL import (
     glUniform4f,
     glGetAttribLocation,
     glLineWidth,
+    glEnable,
+    glDisable,
 )
 
 # Default XYZ axes: 3 lines from origin (length 40 mm)
@@ -139,25 +143,35 @@ def _translate(x: float, y: float, z: float) -> np.ndarray:
 
 class SimulationWidget(QOpenGLWidget):
     """
-    OpenGL widget that displays a 3D polyline (toolpath).
-    Uses Compatibility Profile for macOS. Set points via set_points().
+    OpenGL widget that displays 3D toolpath and stock.
+    Uses Compatibility Profile. Set points via set_points().
     Camera: left-drag orbit, right-drag pan, wheel zoom.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._points: np.ndarray = np.zeros((0, 3), dtype=np.float32)
+        self._stock_vertices: np.ndarray = np.zeros((0, 3), dtype=np.float32)
+        self._stock_indices: np.ndarray = np.zeros((0, 3), dtype=np.int32)
+        self._show_stock: bool = False
+        
         self._program: int = 0
         self._attr_position: int = -1
         self._uniform_mvp: int = -1
         self._uniform_color: int = -1
         self._gl_initialized: bool = False
 
-        self._rot_x = -20.0
-        self._rot_y = 30.0
-        self._zoom = 1.0
-        self._pan_x = 0.0
-        self._pan_y = 0.0
+        self._default_rot_x = -20.0
+        self._default_rot_y = 30.0
+        self._default_zoom = 1.0
+        self._default_pan_x = 0.0
+        self._default_pan_y = 0.0
+        
+        self._rot_x = self._default_rot_x
+        self._rot_y = self._default_rot_y
+        self._zoom = self._default_zoom
+        self._pan_x = self._default_pan_x
+        self._pan_y = self._default_pan_y
         self._last_pos = None
 
         fmt = QSurfaceFormat()
@@ -168,12 +182,39 @@ class SimulationWidget(QOpenGLWidget):
         self.setFormat(fmt)
 
     def set_points(self, points: np.ndarray) -> None:
+        """Set toolpath points."""
         if points is None or len(points) == 0:
             self._points = np.zeros((0, 3), dtype=np.float32)
         else:
             self._points = np.asarray(points, dtype=np.float32)
             if self._points.ndim != 2 or self._points.shape[1] != 3:
                 self._points = np.zeros((0, 3), dtype=np.float32)
+        self.update()
+
+    def set_stock_mesh(self, vertices: np.ndarray, indices: np.ndarray) -> None:
+        """Set stock mesh for rendering."""
+        if vertices is not None and len(vertices) > 0:
+            self._stock_vertices = np.asarray(vertices, dtype=np.float32)
+            self._stock_indices = np.asarray(indices, dtype=np.int32)
+            self._show_stock = True
+        else:
+            self._stock_vertices = np.zeros((0, 3), dtype=np.float32)
+            self._stock_indices = np.zeros((0, 3), dtype=np.int32)
+            self._show_stock = False
+        self.update()
+
+    def show_stock(self, show: bool) -> None:
+        """Toggle stock visibility."""
+        self._show_stock = show and len(self._stock_vertices) > 0
+        self.update()
+
+    def reset_view(self) -> None:
+        """Reset camera to default view."""
+        self._rot_x = self._default_rot_x
+        self._rot_y = self._default_rot_y
+        self._zoom = self._default_zoom
+        self._pan_x = self._default_pan_x
+        self._pan_y = self._default_pan_y
         self.update()
 
     def initializeGL(self) -> None:
@@ -202,11 +243,21 @@ class SimulationWidget(QOpenGLWidget):
         glViewport(0, 0, w, h)
 
     def _build_mvp(self) -> np.ndarray:
+        """Build model-view-projection matrix."""
         w, h = max(1, self.width()), max(1, self.height())
         aspect = w / h
-        if self._points is not None and len(self._points) > 0:
-            mn = self._points.min(axis=0)
-            mx = self._points.max(axis=0)
+        
+        # Calculate bounds from all visible geometry
+        all_points = []
+        if len(self._points) > 0:
+            all_points.append(self._points)
+        if self._show_stock and len(self._stock_vertices) > 0:
+            all_points.append(self._stock_vertices)
+        
+        if all_points:
+            combined = np.concatenate(all_points, axis=0)
+            mn = combined.min(axis=0)
+            mx = combined.max(axis=0)
             size = float(np.max(mx - mn))
             if size < 1e-6:
                 size = 10.0
@@ -215,18 +266,19 @@ class SimulationWidget(QOpenGLWidget):
         else:
             half = 50.0
             cen = np.zeros(3, dtype=np.float32)
+        
         left = -aspect * half * self._zoom + self._pan_x
         right = aspect * half * self._zoom + self._pan_x
         bottom = -half * self._zoom + self._pan_y
         top = half * self._zoom + self._pan_y
+        
         P = _ortho(left, right, bottom, top, -1000.0, 1000.0)
         T_pan = _translate(self._pan_x, self._pan_y, 0.0)
         Rx = _rotate_x(self._rot_x)
         Ry = _rotate_y(self._rot_y)
         T_cent = _translate(-float(cen[0]), -float(cen[1]), -float(cen[2]))
         V = T_pan @ Rx @ Ry @ T_cent
-        mvp = (P @ V).astype(np.float32)
-        return mvp
+        return (P @ V).astype(np.float32)
 
     def paintGL(self) -> None:
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -234,47 +286,94 @@ class SimulationWidget(QOpenGLWidget):
         
         if not self._program or self._attr_position < 0:
             return
-            
+        
         glUseProgram(self._program)
         mvp = self._build_mvp()
         glUniformMatrix4fv(self._uniform_mvp, 1, True, mvp)
         
-        if self._points is None or len(self._points) < 2:
-            # Draw XYZ axes
-            glUniform4f(self._uniform_color, 0.9, 0.25, 0.2, 1.0)  # X red
-            axes = np.ascontiguousarray(AXES_VERTICES[:6], dtype=np.float32)
-            glEnableVertexAttribArray(self._attr_position)
-            glVertexAttribPointer(self._attr_position, 3, GL_FLOAT, False, 0, axes)
-            glDrawArrays(GL_LINES, 0, 2)
-            glDisableVertexAttribArray(self._attr_position)
-            
-            glUniform4f(self._uniform_color, 0.2, 0.85, 0.3, 1.0)  # Y green
-            axes = np.ascontiguousarray(AXES_VERTICES[6:12], dtype=np.float32)
-            glEnableVertexAttribArray(self._attr_position)
-            glVertexAttribPointer(self._attr_position, 3, GL_FLOAT, False, 0, axes)
-            glDrawArrays(GL_LINES, 0, 2)
-            glDisableVertexAttribArray(self._attr_position)
-            
-            glUniform4f(self._uniform_color, 0.25, 0.5, 0.95, 1.0)  # Z blue
-            axes = np.ascontiguousarray(AXES_VERTICES[12:], dtype=np.float32)
-            glEnableVertexAttribArray(self._attr_position)
-            glVertexAttribPointer(self._attr_position, 3, GL_FLOAT, False, 0, axes)
-            glDrawArrays(GL_LINES, 0, 2)
-            glDisableVertexAttribArray(self._attr_position)
+        # Draw stock mesh first (if enabled)
+        if self._show_stock and len(self._stock_vertices) > 0 and len(self._stock_indices) > 0:
+            self._draw_stock()
+        
+        # Draw toolpath
+        if len(self._points) >= 2:
+            self._draw_toolpath()
         else:
-            # Draw toolpath
-            glUniform4f(self._uniform_color, 0.2, 0.7, 0.9, 1.0)
-            try:
-                glLineWidth(2.0)
-            except Exception:
-                pass
-            pts = np.ascontiguousarray(self._points, dtype=np.float32)
-            glEnableVertexAttribArray(self._attr_position)
-            glVertexAttribPointer(self._attr_position, 3, GL_FLOAT, False, 0, pts)
-            glDrawArrays(GL_LINE_STRIP, 0, len(self._points))
-            glDisableVertexAttribArray(self._attr_position)
+            self._draw_axes()
         
         glUseProgram(0)
+
+    def _draw_stock(self) -> None:
+        """Draw stock mesh as wireframe."""
+        glUniform4f(self._uniform_color, 0.6, 0.4, 0.2, 1.0)  # Brown-ish
+        
+        # Draw as wireframe lines between vertices
+        try:
+            glLineWidth(1.0)
+        except Exception:
+            pass
+        
+        # Flatten indices to draw triangles as line loops
+        lines = []
+        for tri in self._stock_indices:
+            lines.extend([tri[0], tri[1], tri[1], tri[2], tri[2], tri[0]])
+        
+        if lines:
+            line_indices = np.array(lines, dtype=np.int32)
+            vertices = self._stock_vertices.flatten()
+            
+            for i in range(0, len(line_indices), 2):
+                idx0, idx1 = line_indices[i], line_indices[i+1]
+                if idx0 < len(self._stock_vertices) and idx1 < len(self._stock_vertices):
+                    pts = np.array([
+                        self._stock_vertices[idx0],
+                        self._stock_vertices[idx1]
+                    ], dtype=np.float32).flatten()
+                    
+                    glEnableVertexAttribArray(self._attr_position)
+                    glVertexAttribPointer(self._attr_position, 3, GL_FLOAT, False, 0, pts)
+                    glDrawArrays(GL_LINES, 0, 2)
+                    glDisableVertexAttribArray(self._attr_position)
+
+    def _draw_toolpath(self) -> None:
+        """Draw toolpath polyline."""
+        glUniform4f(self._uniform_color, 0.2, 0.7, 0.9, 1.0)  # Cyan
+        try:
+            glLineWidth(2.0)
+        except Exception:
+            pass
+        
+        pts = np.ascontiguousarray(self._points, dtype=np.float32)
+        glEnableVertexAttribArray(self._attr_position)
+        glVertexAttribPointer(self._attr_position, 3, GL_FLOAT, False, 0, pts)
+        glDrawArrays(GL_LINE_STRIP, 0, len(self._points))
+        glDisableVertexAttribArray(self._attr_position)
+
+    def _draw_axes(self) -> None:
+        """Draw XYZ axes when no toolpath loaded."""
+        # X axis - Red
+        glUniform4f(self._uniform_color, 0.9, 0.25, 0.2, 1.0)
+        axes = np.ascontiguousarray(AXES_VERTICES[:6], dtype=np.float32)
+        glEnableVertexAttribArray(self._attr_position)
+        glVertexAttribPointer(self._attr_position, 3, GL_FLOAT, False, 0, axes)
+        glDrawArrays(GL_LINES, 0, 2)
+        glDisableVertexAttribArray(self._attr_position)
+        
+        # Y axis - Green
+        glUniform4f(self._uniform_color, 0.2, 0.85, 0.3, 1.0)
+        axes = np.ascontiguousarray(AXES_VERTICES[6:12], dtype=np.float32)
+        glEnableVertexAttribArray(self._attr_position)
+        glVertexAttribPointer(self._attr_position, 3, GL_FLOAT, False, 0, axes)
+        glDrawArrays(GL_LINES, 0, 2)
+        glDisableVertexAttribArray(self._attr_position)
+        
+        # Z axis - Blue
+        glUniform4f(self._uniform_color, 0.25, 0.5, 0.95, 1.0)
+        axes = np.ascontiguousarray(AXES_VERTICES[12:], dtype=np.float32)
+        glEnableVertexAttribArray(self._attr_position)
+        glVertexAttribPointer(self._attr_position, 3, GL_FLOAT, False, 0, axes)
+        glDrawArrays(GL_LINES, 0, 2)
+        glDisableVertexAttribArray(self._attr_position)
 
     def mousePressEvent(self, event):
         self._last_pos = event.position()

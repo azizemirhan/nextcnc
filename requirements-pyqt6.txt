@@ -1,0 +1,5 @@
+# Alternative to requirements.txt if PySide6 fails (e.g. SSL during large download).
+# PyQt6 is a single package and may install more reliably.
+PyQt6>=6.5.0
+PyOpenGL>=3.1.0
+numpy>=1.24.0
